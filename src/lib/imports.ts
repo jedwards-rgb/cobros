@@ -1,3 +1,4 @@
+import { activeRecord,ensurePrimaryContact,profileHistory } from './profiles';
 import ExcelJS from 'exceljs';
 import { randomUUID } from 'node:crypto';
 import { inflateRawSync } from 'node:zlib';
@@ -51,20 +52,28 @@ export async function importRows(actor:Actor,input:unknown) {
       if((await tx.query('SELECT id FROM ce_invoices WHERE school_id=? AND reference=?',[actor.school_id,row.referencia])).length)throw new DomainError(`Referencia duplicada: ${row.referencia}. No se importó ninguna fila.`);
       let [student]=await tx.query<{id:string;name:string;grade:string;guardian_id:string}>('SELECT * FROM ce_students WHERE school_id=? AND code=?',[actor.school_id,row.codigo_estudiante]);
       if(student) {
+        await activeRecord(tx,actor.school_id,'student',student.id);
         const [g]=await tx.query<{name:string;email:string|null;phone:string|null}>('SELECT name,email,phone FROM ce_guardians WHERE school_id=? AND id=?',[actor.school_id,student.guardian_id]);
-        if(student.name!==row.estudiante||student.grade!==row.grado||g.name!==row.acudiente||(g.email||'')!==row.email||(g.phone||'')!==row.telefono)throw new DomainError(`Los datos de ${row.codigo_estudiante} difieren de su ficha. No se importó ninguna fila.`);
+        const sameContact=(g.email||'').trim().toLowerCase()===row.email.trim().toLowerCase()&&(g.phone||'').trim()===row.telefono.trim();
+        const knownContact=sameContact||(await tx.query("SELECT id FROM ce_guardian_contacts WHERE school_id=? AND guardian_id=? AND LOWER(TRIM(COALESCE(email,'')))=? AND TRIM(COALESCE(phone,''))=? LIMIT 1",[actor.school_id,student.guardian_id,row.email.trim().toLowerCase(),row.telefono.trim()])).length>0;
+        if(student.name!==row.estudiante||student.grade!==row.grado||g.name.trim().toLowerCase()!==row.acudiente.trim().toLowerCase()||!knownContact)throw new DomainError(`Los datos de ${row.codigo_estudiante} difieren de su ficha. No se importó ninguna fila.`);
       } else {
         const studentId=randomUUID(),timestamp=new Date().toISOString();
         // Reuse only an exact family identity within this school, with at least one contact.
         // A shared name or phone alone is not sufficient.
         const matching=(row.email||row.telefono)?await tx.query<{id:string}>(
-          "SELECT id FROM ce_guardians WHERE school_id=? AND LOWER(TRIM(name))=? AND LOWER(TRIM(COALESCE(email,'')))=? AND TRIM(COALESCE(phone,''))=?",
-          [actor.school_id,row.acudiente.trim().toLowerCase(),row.email.trim().toLowerCase(),row.telefono.trim()],
+          "SELECT g.id FROM ce_guardians g WHERE g.school_id=? AND LOWER(TRIM(g.name))=? AND ((LOWER(TRIM(COALESCE(g.email,'')))=? AND TRIM(COALESCE(g.phone,''))=?) OR EXISTS(SELECT 1 FROM ce_guardian_contacts c WHERE c.school_id=g.school_id AND c.guardian_id=g.id AND LOWER(TRIM(COALESCE(c.email,'')))=? AND TRIM(COALESCE(c.phone,''))=?))",
+          [actor.school_id,row.acudiente.trim().toLowerCase(),row.email.trim().toLowerCase(),row.telefono.trim(),row.email.trim().toLowerCase(),row.telefono.trim()],
         ):[];
         if(matching.length>1)throw new DomainError(`El acudiente ${row.acudiente} tiene fichas duplicadas. Unifica las fichas antes de importar. No se importó ninguna fila.`);
         const guardianId=matching[0]?.id||randomUUID();
+        if(matching.length)await activeRecord(tx,actor.school_id,'guardian',guardianId);
         if(!matching.length)await tx.run('INSERT INTO ce_guardians(id,school_id,name,email,phone,created_at) VALUES (?,?,?,?,?,?)',[guardianId,actor.school_id,row.acudiente,row.email||null,row.telefono||null,timestamp]);
+        await ensurePrimaryContact(tx,actor.school_id,guardianId);
+        if(!matching.length)await profileHistory(tx,actor,'guardian',guardianId,'Acudiente importado','Importación desde Excel',null,{name:row.acudiente,email:row.email,phone:row.telefono});
         await tx.run('INSERT INTO ce_students(id,school_id,guardian_id,code,name,grade,created_at) VALUES (?,?,?,?,?,?,?)',[studentId,actor.school_id,guardianId,row.codigo_estudiante,row.estudiante,row.grado,timestamp]);
+        await tx.run('UPDATE ce_guardians SET version=version+1 WHERE school_id=? AND id=?',[actor.school_id,guardianId]);
+        await profileHistory(tx,actor,'student',studentId,'Estudiante importado','Importación desde Excel',null,{code:row.codigo_estudiante,name:row.estudiante,guardian_id:guardianId});
         student={id:studentId,name:row.estudiante,grade:row.grado,guardian_id:guardianId};
       }
       const invoiceId=randomUUID();await tx.run('INSERT INTO ce_invoices(id,school_id,student_id,reference,concept,due_date,amount_cents,late_fee_cents,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',[invoiceId,actor.school_id,student.id,row.referencia,row.concepto,row.vencimiento,value,fee,actor.id,new Date().toISOString()]);await audit(tx,actor,'Cuenta importada desde Excel',invoiceId);

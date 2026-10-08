@@ -1,3 +1,4 @@
+import { migrateProfiles } from './profile-migration';
 import { db, transaction } from './db';
 const tables = [
 `CREATE TABLE IF NOT EXISTS ce_schools (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL)`,
@@ -18,7 +19,7 @@ const tables = [
 `CREATE INDEX IF NOT EXISTS ce_audit_school ON ce_audit(school_id,created_at)`,
 ];
 export async function migrate() {
-  await transaction(async(tx)=>{for(const sql of tables) await tx.run(sql);});
+  await transaction(async(tx)=>{for(const sql of tables) await tx.run(sql);await migrateProfiles(tx,!!process.env.DATABASE_URL);});
   // Supabase REST roles never receive access to these application-owned tables.
   if(process.env.DATABASE_URL) await db.run(`DO $$ DECLARE t record; r text; BEGIN FOR t IN SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'ce_%' LOOP EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY',t.tablename); FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON TABLE public.%I FROM %I',t.tablename,r); END IF; END LOOP; END LOOP; END $$`);
 }

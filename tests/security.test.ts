@@ -39,7 +39,7 @@ test('Recordatorios tres días antes: deduplicación, consentimiento, saldo y no
  const before=new Date(`${plusDays(today(),-1)}T13:00:00Z`);await prepareReminders(before);assert.equal((await db.query('SELECT id FROM ce_outbox WHERE school_id=?',[f.school])).length,0);
  const now=new Date(today()+'T13:00:00Z');await prepareReminders(now);await prepareReminders(now);assert.equal((await db.query('SELECT id FROM ce_outbox WHERE school_id=?',[f.school])).length,2);
  process.env.SEND_ENABLED='false';let sent=0;await dispatchReminders(async()=>{sent++;return 'fake';},now);assert.equal(sent,0);
- await mutate(f.cashier,'consent',{guardian_id:f.g,email_consent:false,whatsapp_consent:true,consent_note:'Retiro de autorización para correo'});
+ await mutate(f.cashier,'consent',{guardian_id:f.g,version:(await getData(f.cashier)).guardians.find(g=>g.id===f.g)!.version,email_consent:false,whatsapp_consent:true,consent_note:'Retiro de autorización para correo'});
  process.env.SEND_ENABLED='true';await dispatchReminders(async()=>{sent++;throw new Error('timeout');},now);assert.equal(sent,1);
  await dispatchReminders(async()=>{sent++;return 'fake';},now);assert.equal(sent,1);
  const states=await db.query<{status:string}>('SELECT status FROM ce_outbox WHERE school_id=?',[f.school]);assert.deepEqual(states.map(s=>s.status).sort(),['cancelado','requiere_revision']);
@@ -83,6 +83,30 @@ test('Importación acepta 500 filas exactas y rechaza 501 sin cambios',async()=>
  assert.equal(await importRows(f.cashier,rows),500);const data=await getData(f.cashier);assert.equal(data.students.length,501);assert.equal(data.invoices.reduce((n,i)=>n+i.amount_cents+i.late_fee_cents,0),42000+15000);
 });
 async function workbook(formula=false) {const book=new ExcelJS.Workbook(),sheet=book.addWorksheet('Importar');sheet.addRow([...columns]);sheet.addRow(['A1','Estudiante','1 A','Acudiente','familia@example.test','+50761234567','REF-01','Mensualidad',today(),'100.00','0.00']);if(formula)sheet.getCell('J2').value={formula:'1+1',result:2};return Buffer.from(await book.xlsx.writeBuffer());}
+
+test('Hermanos importados comparten acudiente con identidad y contactos exactos',async()=>{
+ const f=await fixture();
+ const row={codigo_estudiante:'H1',estudiante:'Hermano uno',grado:'1 A',acudiente:'Madre prueba',email:'madre@example.test',telefono:'+50761234568',referencia:'H1',concepto:'Mensualidad',vencimiento:today(),monto:'100.00',mora:'0.00'};
+ await Promise.all([importRows(f.cashier,[row]),importRows(f.cashier,[{...row,codigo_estudiante:'H2',estudiante:'Hermano dos',referencia:'H2'}])]);
+ const data=await getData(f.cashier);
+ assert.equal(data.guardians.length,2);
+ const students=await db.query<{guardian_id:string}>("SELECT guardian_id FROM ce_students WHERE school_id=? AND code IN ('H1','H2')",[f.school]);
+ assert.equal(students.length,2);assert.equal(students[0].guardian_id,students[1].guardian_id);
+ assert.equal(data.invoices.filter(i=>i.reference.startsWith('H')).length,2);
+ const other=await fixture();await importRows(other.cashier,[{...row,codigo_estudiante:'H3',referencia:'H3'}]);
+ assert.equal((await getData(other.cashier)).guardians.length,2);
+ await importRows(f.cashier,[{...row,codigo_estudiante:'H4',referencia:'H4',acudiente:'Otro responsable'}]);
+ assert.equal((await getData(f.cashier)).guardians.length,3);
+});
+
+test('Importación no fusiona nombres sin contactos y rechaza identidad ambigua',async()=>{
+ const f=await fixture();const row={codigo_estudiante:'A1',estudiante:'Alumno uno',grado:'1 A',acudiente:'Sin contacto',email:'',telefono:'',referencia:'A1',concepto:'Mensualidad',vencimiento:today(),monto:'100.00',mora:'0.00'};
+ await importRows(f.cashier,[row,{...row,codigo_estudiante:'A2',referencia:'A2'}]);
+ assert.equal((await getData(f.cashier)).guardians.length,3);
+ for(let i=0;i<2;i++)await mutate(f.cashier,'guardian',{name:'Duplicado',email:'duplicado@example.test',phone:'+50761234569',email_consent:false,whatsapp_consent:false,consent_note:''});
+ await assert.rejects(()=>importRows(f.cashier,[{...row,codigo_estudiante:'A3',referencia:'A3',acudiente:'Duplicado',email:'duplicado@example.test',telefono:'+50761234569'}]),/duplicadas/);
+ assert.equal((await getData(f.cashier)).students.length,3);
+});
 test('Excel válido se importa y se rechazan fórmulas, ZIP inválido y tamaños falseados',async()=>{
  const bytes=await workbook();assert.equal((await parseWorkbook(bytes))[0].monto,'100.00');
  await assert.rejects(()=>parseWorkbook(awaitableInvalid()),/XLSX/);

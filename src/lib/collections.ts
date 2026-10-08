@@ -1,8 +1,9 @@
+import { schoolTransaction,activeRecord,ensurePrimaryContact,syncPrimary,profileHistory,profileActions,mutateProfile } from './profiles';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { db,transaction,type DB } from './db';
+import { db,type DB } from './db';
 import { allow,amount,balance,cents,date,DomainError,id,text,today } from './domain';
-import type { Actor,Invoice,Guardian,PromiseRow } from './types';
+import type { Actor,Invoice,Guardian,PromiseRow,Student } from './types';
 
 export const guardianSchema=z.object({name:text,email:z.union([z.email().max(180),z.literal('')]),phone:z.union([z.string().regex(/^\+[1-9]\d{7,14}$/,'Usa formato internacional: +50761234567'),z.literal('')]),email_consent:z.boolean(),whatsapp_consent:z.boolean(),consent_note:z.string().trim().max(500)}).refine(v=>(!v.email_consent||!!v.email)&&(!v.whatsapp_consent||!!v.phone)&&(!(v.email_consent||v.whatsapp_consent)||v.consent_note.length>=5),'Registra el contacto y la evidencia de autorización para cada canal.');
 const studentSchema=z.object({guardian_id:id,code:text.max(40),name:text,grade:text.max(60)});
@@ -11,27 +12,36 @@ const paymentSchema=z.object({invoice_id:id,request_key:id,reference:text.max(10
 const promiseSchema=z.object({invoice_id:id,amount,due_date:date.refine(v=>v>=today(),'La promesa debe ser para hoy o después.'),notes:z.string().max(2000)});
 const callSchema=z.object({guardian_id:id,outcome:z.enum(['Contestó','No contestó','Número incorrecto','Llamar nuevamente','Promesa de pago','Acuerdo de pago']),notes:z.string().max(2000),next_contact:z.union([date.refine(v=>v>=today(),'El próximo seguimiento no puede estar en el pasado.'),z.literal('')])});
 export async function audit(tx:DB,actor:Actor,action:string,entity:string) {await tx.run('INSERT INTO ce_audit(id,school_id,actor_id,action,entity_id,created_at) VALUES (?,?,?,?,?,?)',[randomUUID(),actor.school_id,actor.id,action,entity,new Date().toISOString()]);}
-async function exists(tx:DB,table:'ce_guardians'|'ce_students'|'ce_invoices'|'ce_promises',actor:Actor,entity:string) {const [row]=await tx.query(`SELECT id FROM ${table} WHERE school_id=? AND id=?`,[actor.school_id,entity]);if(!row)throw new DomainError('Registro no encontrado.',404);}
 export async function mutate(actor:Actor,action:string,input:unknown) {
+  if((profileActions as readonly string[]).includes(action))return mutateProfile(actor,action,input);
   if(action==='guardian') {
-    allow(actor,['cobranza']);const v=guardianSchema.parse(input);const entity=randomUUID();
-    return transaction(async(tx)=>{await tx.run('INSERT INTO ce_guardians(id,school_id,name,email,phone,email_consent,whatsapp_consent,consent_note,created_at) VALUES (?,?,?,?,?,?,?,?,?)',[entity,actor.school_id,v.name,v.email||null,v.phone||null,+v.email_consent,+v.whatsapp_consent,v.consent_note||null,new Date().toISOString()]);await audit(tx,actor,'Acudiente registrado',entity);return entity;});
+    allow(actor,['cobranza','seguimiento']);const v=guardianSchema.parse(input);const entity=randomUUID();
+    return schoolTransaction(actor,async(tx)=>{await tx.run('INSERT INTO ce_guardians(id,school_id,name,email,phone,email_consent,whatsapp_consent,consent_note,created_at) VALUES (?,?,?,?,?,?,?,?,?)',[entity,actor.school_id,v.name,v.email||null,v.phone||null,+v.email_consent,+v.whatsapp_consent,v.consent_note||null,new Date().toISOString()]);await ensurePrimaryContact(tx,actor.school_id,entity);await profileHistory(tx,actor,'guardian',entity,'Acudiente registrado','Registro inicial',null,v);return entity;});
   }
   if(action==='consent') {
-    allow(actor,['cobranza']);const v=z.object({guardian_id:id,email_consent:z.boolean(),whatsapp_consent:z.boolean(),consent_note:text.max(500)}).parse(input);
-    return transaction(async(tx)=>{const [g]=await tx.query<Guardian>('SELECT * FROM ce_guardians WHERE school_id=? AND id=?',[actor.school_id,v.guardian_id]);if(!g)throw new DomainError('Acudiente no encontrado',404);if((v.email_consent&&!g.email)||(v.whatsapp_consent&&!g.phone))throw new DomainError('Falta el contacto para ese canal.');await tx.run('UPDATE ce_guardians SET email_consent=?,whatsapp_consent=?,consent_note=? WHERE school_id=? AND id=?',[+v.email_consent,+v.whatsapp_consent,v.consent_note,actor.school_id,v.guardian_id]);await audit(tx,actor,'Preferencias de contacto actualizadas',v.guardian_id);});
+    allow(actor,['cobranza','seguimiento']);const v=z.object({guardian_id:id,version:z.number().int().positive(),email_consent:z.boolean(),whatsapp_consent:z.boolean(),consent_note:z.string().trim().min(5).max(500)}).parse(input);
+    return schoolTransaction(actor,async tx=>{
+      const g=await activeRecord(tx,actor.school_id,'guardian',v.guardian_id) as Guardian;
+      if(g.version!==v.version)throw new DomainError('La ficha cambió. Recarga antes de actualizar la autorización.',409);
+      if((v.email_consent&&!g.email)||(v.whatsapp_consent&&!g.phone))throw new DomainError('Falta el contacto para ese canal.');
+      await ensurePrimaryContact(tx,actor.school_id,v.guardian_id);
+      await tx.run('UPDATE ce_guardian_contacts SET email_consent=?,whatsapp_consent=?,consent_note=?,updated_at=? WHERE school_id=? AND guardian_id=? AND is_primary=1',[+v.email_consent,+v.whatsapp_consent,v.consent_note,new Date().toISOString(),actor.school_id,v.guardian_id]);
+      await syncPrimary(tx,actor.school_id,v.guardian_id);
+      await tx.run('UPDATE ce_guardians SET version=version+1 WHERE school_id=? AND id=?',[actor.school_id,v.guardian_id]);
+      await profileHistory(tx,actor,'guardian',v.guardian_id,'Autorización del contacto principal actualizada',v.consent_note,g,v);
+    });
   }
   if(action==='student') {
-    allow(actor,['cobranza']);const v=studentSchema.parse(input);const entity=randomUUID();
-    return transaction(async(tx)=>{await exists(tx,'ce_guardians',actor,v.guardian_id);await tx.run('INSERT INTO ce_students(id,school_id,guardian_id,code,name,grade,created_at) VALUES (?,?,?,?,?,?,?)',[entity,actor.school_id,v.guardian_id,v.code,v.name,v.grade,new Date().toISOString()]);await audit(tx,actor,'Estudiante registrado',entity);return entity;});
+    allow(actor,['cobranza','seguimiento']);const v=studentSchema.parse(input);const entity=randomUUID();
+    return schoolTransaction(actor,async(tx)=>{await activeRecord(tx,actor.school_id,'guardian',v.guardian_id);await tx.run('INSERT INTO ce_students(id,school_id,guardian_id,code,name,grade,created_at) VALUES (?,?,?,?,?,?,?)',[entity,actor.school_id,v.guardian_id,v.code,v.name,v.grade,new Date().toISOString()]);await tx.run('UPDATE ce_guardians SET version=version+1 WHERE school_id=? AND id=?',[actor.school_id,v.guardian_id]);await profileHistory(tx,actor,'student',entity,'Estudiante registrado','Registro inicial',null,v);return entity;});
   }
   if(action==='invoice') {
     allow(actor,['cobranza']);const v=invoiceSchema.parse(input);const entity=randomUUID();
-    return transaction(async(tx)=>{await exists(tx,'ce_students',actor,v.student_id);await tx.run('INSERT INTO ce_invoices(id,school_id,student_id,reference,concept,due_date,amount_cents,late_fee_cents,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',[entity,actor.school_id,v.student_id,v.reference,v.concept,v.due_date,cents(v.amount),cents(v.late_fee,true),actor.id,new Date().toISOString()]);await audit(tx,actor,'Cuenta por cobrar registrada',entity);return entity;});
+    return schoolTransaction(actor,async(tx)=>{await activeRecord(tx,actor.school_id,'student',v.student_id);await tx.run('INSERT INTO ce_invoices(id,school_id,student_id,reference,concept,due_date,amount_cents,late_fee_cents,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',[entity,actor.school_id,v.student_id,v.reference,v.concept,v.due_date,cents(v.amount),cents(v.late_fee,true),actor.id,new Date().toISOString()]);await audit(tx,actor,'Cuenta por cobrar registrada',entity);return entity;});
   }
   if(action==='payment') {
     allow(actor,['cobranza']);const v=paymentSchema.parse(input);const value=cents(v.amount);
-    return transaction(async(tx)=>{
+    return schoolTransaction(actor,async(tx)=>{
       // Acquires the invoice write lock on PostgreSQL; SQLite transactions are serialized.
       await tx.run('UPDATE ce_invoices SET paid_cents=paid_cents WHERE school_id=? AND id=?',[actor.school_id,v.invoice_id]);
       const [invoice]=await tx.query<Invoice>('SELECT * FROM ce_invoices WHERE school_id=? AND id=?',[actor.school_id,v.invoice_id]);if(!invoice)throw new DomainError('Cuenta no encontrada.',404);
@@ -47,9 +57,10 @@ export async function mutate(actor:Actor,action:string,input:unknown) {
   }
   if(action==='promise') {
     allow(actor,['seguimiento']);const v=promiseSchema.parse(input);const value=cents(v.amount);
-    return transaction(async(tx)=>{
+    return schoolTransaction(actor,async(tx)=>{
       await tx.run('UPDATE ce_invoices SET paid_cents=paid_cents WHERE school_id=? AND id=?',[actor.school_id,v.invoice_id]);
       const [i]=await tx.query<Invoice>('SELECT * FROM ce_invoices WHERE school_id=? AND id=?',[actor.school_id,v.invoice_id]);if(!i)throw new DomainError('Cuenta no encontrada.',404);
+      await activeRecord(tx,actor.school_id,'student',i.student_id);
       if(value>balance(i))throw new DomainError('La promesa supera el saldo pendiente.');
       if((await tx.query("SELECT id FROM ce_promises WHERE school_id=? AND invoice_id=? AND status='pendiente'",[actor.school_id,i.id])).length)throw new DomainError('Ya existe una promesa abierta. Cancélala antes de sustituirla.');
       const entity=randomUUID();await tx.run('INSERT INTO ce_promises(id,school_id,invoice_id,amount_cents,baseline_paid_cents,due_date,notes,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)',[entity,actor.school_id,i.id,value,i.paid_cents,v.due_date,v.notes,actor.id,new Date().toISOString()]);await audit(tx,actor,'Promesa registrada',entity);return entity;
@@ -57,7 +68,7 @@ export async function mutate(actor:Actor,action:string,input:unknown) {
   }
   if(action==='cancel-promise') {
     allow(actor,['seguimiento']);const v=z.object({promise_id:id,reason:text.max(500)}).parse(input);
-    return transaction(async(tx)=>{
+    return schoolTransaction(actor,async(tx)=>{
       const [promise]=await tx.query<{invoice_id:string}>('SELECT invoice_id FROM ce_promises WHERE school_id=? AND id=?',[actor.school_id,v.promise_id]);
       if(!promise)throw new DomainError('Registro no encontrado.',404);
       // Same lock order as payments and dispatch: invoice first, then promise.
@@ -69,7 +80,7 @@ export async function mutate(actor:Actor,action:string,input:unknown) {
   }
   if(action==='call') {
     allow(actor,['seguimiento']);const v=callSchema.parse(input);const entity=randomUUID();
-    return transaction(async(tx)=>{await exists(tx,'ce_guardians',actor,v.guardian_id);await tx.run('INSERT INTO ce_calls(id,school_id,guardian_id,outcome,notes,next_contact,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)',[entity,actor.school_id,v.guardian_id,v.outcome,v.notes,v.next_contact||null,actor.id,new Date().toISOString()]);await audit(tx,actor,'Llamada registrada',entity);return entity;});
+    return schoolTransaction(actor,async(tx)=>{await activeRecord(tx,actor.school_id,'guardian',v.guardian_id);await tx.run('INSERT INTO ce_calls(id,school_id,guardian_id,outcome,notes,next_contact,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)',[entity,actor.school_id,v.guardian_id,v.outcome,v.notes,v.next_contact||null,actor.id,new Date().toISOString()]);await audit(tx,actor,'Llamada registrada',entity);return entity;});
   }
   throw new DomainError('Operación desconocida.',404);
 }
@@ -78,7 +89,7 @@ export async function getData(actor:Actor) {
   const school=actor.school_id;
   const [guardians,students,invoices,payments,promises,calls,outbox,auditRows]=await Promise.all([
     db.query<Guardian>('SELECT * FROM ce_guardians WHERE school_id=? ORDER BY name',[school]),
-    db.query<{id:string;name:string;code:string;grade:string;guardian_name:string}>('SELECT st.*,g.name AS guardian_name FROM ce_students st JOIN ce_guardians g ON g.id=st.guardian_id AND g.school_id=st.school_id WHERE st.school_id=? ORDER BY st.name',[school]),
+    db.query<Student&{guardian_name:string}>('SELECT st.*,g.name AS guardian_name FROM ce_students st JOIN ce_guardians g ON g.id=st.guardian_id AND g.school_id=st.school_id WHERE st.school_id=? ORDER BY st.name',[school]),
     db.query<Invoice>('SELECT i.*,st.name AS student_name,st.grade,g.name AS guardian_name,g.id AS guardian_id FROM ce_invoices i JOIN ce_students st ON st.id=i.student_id AND st.school_id=i.school_id JOIN ce_guardians g ON g.id=st.guardian_id AND g.school_id=st.school_id WHERE i.school_id=? ORDER BY i.due_date,i.reference',[school]),
     db.query<{id:string;invoice_id:string;amount_cents:number;reference:string;method:string;paid_on:string;created_at:string;author:string;student_name:string}>('SELECT p.*,u.name AS author,st.name AS student_name FROM ce_payments p JOIN ce_users u ON u.id=p.created_by AND u.school_id=p.school_id JOIN ce_invoices i ON i.id=p.invoice_id AND i.school_id=p.school_id JOIN ce_students st ON st.id=i.student_id AND st.school_id=i.school_id WHERE p.school_id=? ORDER BY p.created_at DESC',[school]),
     db.query<PromiseRow>('SELECT p.*,i.paid_cents,st.name AS student_name,g.name AS guardian_name FROM ce_promises p JOIN ce_invoices i ON i.id=p.invoice_id AND i.school_id=p.school_id JOIN ce_students st ON st.id=i.student_id AND st.school_id=i.school_id JOIN ce_guardians g ON g.id=st.guardian_id AND g.school_id=st.school_id WHERE p.school_id=? ORDER BY p.due_date',[school]),
