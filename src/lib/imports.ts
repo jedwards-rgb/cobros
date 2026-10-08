@@ -44,6 +44,8 @@ export async function parseWorkbook(bytes:Buffer):Promise<ImportRow[]> {
 export async function importRows(actor:Actor,input:unknown) {
   allow(actor,['cobranza']);const rows=z.array(importSchema).min(1).max(500).parse(input);
   return transaction(async tx=>{
+    // Serialize imports for this school so simultaneous files cannot create two family records.
+    await tx.run('UPDATE ce_schools SET name=name WHERE id=?',[actor.school_id]);
     for(const row of rows) {
       const value=cents(row.monto),fee=cents(row.mora,true);
       if((await tx.query('SELECT id FROM ce_invoices WHERE school_id=? AND reference=?',[actor.school_id,row.referencia])).length)throw new DomainError(`Referencia duplicada: ${row.referencia}. No se importó ninguna fila.`);
@@ -52,9 +54,16 @@ export async function importRows(actor:Actor,input:unknown) {
         const [g]=await tx.query<{name:string;email:string|null;phone:string|null}>('SELECT name,email,phone FROM ce_guardians WHERE school_id=? AND id=?',[actor.school_id,student.guardian_id]);
         if(student.name!==row.estudiante||student.grade!==row.grado||g.name!==row.acudiente||(g.email||'')!==row.email||(g.phone||'')!==row.telefono)throw new DomainError(`Los datos de ${row.codigo_estudiante} difieren de su ficha. No se importó ninguna fila.`);
       } else {
-        const guardianId=randomUUID(),studentId=randomUUID(),timestamp=new Date().toISOString();
-        // Deliberately no merging by name: siblings can be linked manually after verification.
-        await tx.run('INSERT INTO ce_guardians(id,school_id,name,email,phone,created_at) VALUES (?,?,?,?,?,?)',[guardianId,actor.school_id,row.acudiente,row.email||null,row.telefono||null,timestamp]);
+        const studentId=randomUUID(),timestamp=new Date().toISOString();
+        // Reuse only an exact family identity within this school, with at least one contact.
+        // A shared name or phone alone is not sufficient.
+        const matching=(row.email||row.telefono)?await tx.query<{id:string}>(
+          "SELECT id FROM ce_guardians WHERE school_id=? AND LOWER(TRIM(name))=? AND LOWER(TRIM(COALESCE(email,'')))=? AND TRIM(COALESCE(phone,''))=?",
+          [actor.school_id,row.acudiente.trim().toLowerCase(),row.email.trim().toLowerCase(),row.telefono.trim()],
+        ):[];
+        if(matching.length>1)throw new DomainError(`El acudiente ${row.acudiente} tiene fichas duplicadas. Unifica las fichas antes de importar. No se importó ninguna fila.`);
+        const guardianId=matching[0]?.id||randomUUID();
+        if(!matching.length)await tx.run('INSERT INTO ce_guardians(id,school_id,name,email,phone,created_at) VALUES (?,?,?,?,?,?)',[guardianId,actor.school_id,row.acudiente,row.email||null,row.telefono||null,timestamp]);
         await tx.run('INSERT INTO ce_students(id,school_id,guardian_id,code,name,grade,created_at) VALUES (?,?,?,?,?,?,?)',[studentId,actor.school_id,guardianId,row.codigo_estudiante,row.estudiante,row.grado,timestamp]);
         student={id:studentId,name:row.estudiante,grade:row.grado,guardian_id:guardianId};
       }
